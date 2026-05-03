@@ -1,11 +1,8 @@
 import os
 from supabase import create_client
-from dotenv import load_dotenv
 
-load_dotenv()
-
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+SUPABASE_URL="https://rdntsvuwxttksdvexkmp.supabase.co"
+SUPABASE_KEY="sb_publishable_poyp9fna_C_QVx-9k-ZcIA_vLUoexvJ"
 
 client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -36,6 +33,15 @@ def upload_image(file, filename):
         file=file.read(),
         file_options={"content-type": file.type}
     )
-    # Get public URL
     url = client.storage.from_("post-images").get_public_url(filename)
     return url
+
+def get_posts_as_context(limit=50):
+    posts = client.table("posts").select("*").order("created_at", desc=True).limit(limit).execute().data
+    if not posts:
+        return ""
+    context = ""
+    for post in posts:
+        car_info = f"{post.get('year', '')} {post.get('make', '')} {post.get('model', '')}".strip()
+        context += f"User @{post['username']} posted about {car_info}: {post['title']} — {post['content']}\n\n"
+    return context

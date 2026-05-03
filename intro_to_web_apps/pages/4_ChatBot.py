@@ -5,6 +5,7 @@ import json
 import os
 import tempfile
 import traceback
+import importlib.util
 from abc import ABC, abstractmethod
 from pathlib import Path
 from sqlite3 import connect
@@ -21,6 +22,13 @@ BASE = Path(__file__).parent.parent.parent
 DB_PATH = BASE / "data" / "structured_data.db"
 CHROMA_PATH = BASE / "data" / "VectorDB"
 CHROMA_COLLECTION = "corpus_collection"
+
+# ── Load supabase ─────────────────────────────────────────────────────────────
+_client_path = Path(__file__).parent.parent / "backend" / "supabase.py"
+_spec = importlib.util.spec_from_file_location("supabase", _client_path)
+_module = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_module)
+get_posts_as_context = _module.get_posts_as_context
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TOKEN COUNTER
@@ -142,24 +150,53 @@ class ChromaDBVectorDB:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class ChromaAgent:
-    def __init__(self, llm, vectordb) -> None:
+    def __init__(self, llm, vectordb, forum_context: str = "") -> None:
         self.llm_ = llm
         self.vectordb_ = vectordb
+        self.forum_context_ = forum_context
         if self.vectordb_.collection_ is None:
             raise ValueError("No collection attached to the vector database.")
 
     def query(self, prompt: str, k: int = 5, max_distance: float = 0.65, show_citations: bool = False):
         self.docs_, self.distances_ = self.vectordb_.retrieve(question=prompt, k=k)
+        
+        if not self.docs_ or not self.distances_:
+            # No ChromaDB results — fall back to forum context only
+            if self.forum_context_:
+                self.prompt_ = (
+                    "You are an intelligent AI assistant. Use the following community forum posts to answer the question.\n\n"
+                    f"### Community Forum Posts ###\n{self.forum_context_}\n\n"
+                    f"### Question ###\n{prompt}"
+                )
+                self.response_ = self.llm_.query(self.prompt_)
+                return self.response_
+            return None
+
         mindist = min(self.distances_)
         if mindist > max_distance:
+            # ChromaDB results not relevant — try forum context
+            if self.forum_context_:
+                self.prompt_ = (
+                    "You are an intelligent AI assistant. Use the following community forum posts to answer the question.\n\n"
+                    f"### Community Forum Posts ###\n{self.forum_context_}\n\n"
+                    f"### Question ###\n{prompt}"
+                )
+                self.response_ = self.llm_.query(self.prompt_)
+                return self.response_
             return None
+
         system_prompt = (
             "You are an intelligent AI assistant answering a question via retrieval augmented generation. "
             "Use the provided context to answer accurately and concisely. "
             "NEVER reference the context you received, simply use it to answer the question.\n\n"
         )
         context_str = "\n\n".join(f"- {doc}" for doc in self.docs_)
-        self.prompt_ = f"{system_prompt}### Context ###\n{context_str}\n\n### Question ###\n{prompt}"
+
+        forum_section = ""
+        if self.forum_context_:
+            forum_section = f"\n\n### Community Forum Posts ###\n{self.forum_context_}"
+
+        self.prompt_ = f"{system_prompt}### Context ###\n{context_str}{forum_section}\n\n### Question ###\n{prompt}"
         self.response_ = self.llm_.query(self.prompt_)
         return self.response_
 
@@ -232,11 +269,7 @@ class SQLiteAgent:
                     self.response_ = self.llm_.structured_query(response_format=SQLResponse, prompt=base_query, system_prompt=system_prompt)
 
                 last_sql = self.response_.sql_query
-                print(f"SQL: {self.response_.sql_query}")
-
                 answer = pd.read_sql(self.response_.sql_query, self.engine_)
-                print(f"Answer shape: {answer.shape}")
-                print(f"Answer preview: {answer.head()}")
 
                 if answer.empty:
                     return "The query ran successfully but returned no results. Try rephrasing or broadening your question."
@@ -249,7 +282,6 @@ class SQLiteAgent:
 
             except Exception as e:
                 error_context = f"{str(e)}\n\n{traceback.format_exc()}"
-                print(f"Attempt {attempts+1} failed: {str(e)}")
                 attempts += 1
                 if attempts > retries:
                     return f"SQL Agent failed after {retries+1} attempt(s): {str(e)}"
@@ -365,18 +397,27 @@ with chat_col:
                 try:
                     llm = OpenAILLM(api_key=openaikey, model_args=DEFAULTS)
 
+                    # Load forum context from Supabase
+                    try:
+                        forum_context = get_posts_as_context(limit=50)
+                    except Exception:
+                        forum_context = ""
+
                     embedder = SentenceTransformerEmbedder()
                     vdb = ChromaDBVectorDB(dbpath=str(CHROMA_PATH), embedder=embedder, distance_measure="cosine")
                     vdb.initialize_db()
                     vdb.initialize_collection(CHROMA_COLLECTION)
-                    rag_agent = ChromaAgent(llm=llm, vectordb=vdb)
-                    rag_desc = "general questions about cars, builds, modifications, parts, and community advice"
+                    rag_agent = ChromaAgent(llm=llm, vectordb=vdb, forum_context=forum_context)
+                    rag_desc = "general questions about cars, builds, modifications, parts, community advice, and user build posts from the REDLINE forum"
                     rag_kwargs = {"k": 5, "max_distance": 0.75, "show_citations": False}
 
                     db_desc = """
-                    database containing automotive make/model/year data for 18 major manufacturers spanning 1980-2024. The primary table (all_brands_combined) has 43,394 records with columns for make_id, make_name, model_id, model_name, and year, enabling lookups by brand, model, or production year. A secondary summary table (brand_decade_summary) aggregates model counts and year ranges by manufacturer per decade.
+                    This database contains automotive make/model/year data for 18 major manufacturers spanning 1980-2024. 
+                    The only table to query is called all_brands_combined. 
+                    It has 43,394 records with these columns: make_id, make_name, model_id, model_name, and year. 
+                    Use ONLY the all_brands_combined table. Do not query any other table.
                     """.rstrip()
-                    sql_agent = SQLiteAgent(llm=llm, database_url=str(DB_PATH), db_desc=db_desc, include_detail=True)
+                    sql_agent = SQLiteAgent(llm=llm, database_url=str(DB_PATH), db_desc=db_desc, include_detail=False)
                     sql_desc = "make, model, and production year of vehicles from 18 major automotive brands spanning 1980-2024 across 43,394 entries"
                     sql_kwargs = {"view_sql": False, "retries": 1}
 
